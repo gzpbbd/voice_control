@@ -3,22 +3,28 @@
 import time
 import torch
 import torch.nn.functional as F
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModel
 from torch import Tensor
 from typing import List, Dict, Optional
 from fastapi.responses import JSONResponse
 from urllib.parse import unquote_plus
+import whisper
+import tempfile
+import os
 
 app = FastAPI()
 
-# Load tokenizer and model
+# Load models
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B", padding_side="left")
-model = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
-model.eval()
+embedding_model = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
+embedding_model.eval()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
+embedding_model.to(device)
+
+# Load Whisper model
+whisper_model = whisper.load_model("turbo")
 
 # Predefined instructions with examples
 INSTRUCTIONS = {
@@ -97,6 +103,11 @@ class QueryResponse(BaseModel):
     matched_instruction: Optional[str] = None
     similarity_score: Optional[float] = None
 
+# Response format for transcription
+class TranscriptionResponse(BaseModel):
+    elapsed_time: float
+    text: str
+
 # Initialize instruction embeddings
 def initialize_instruction_embeddings():
     all_examples = []
@@ -113,7 +124,7 @@ def initialize_instruction_embeddings():
     batch = {k: v.to(device) for k, v in batch.items()}
     
     with torch.no_grad():
-        outputs = model(**batch)
+        outputs = embedding_model(**batch)
         embeddings = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
         embeddings = F.normalize(embeddings, p=2, dim=1)
     
@@ -143,7 +154,7 @@ async def get_embedding(text: str):
 
     # Forward pass
     with torch.no_grad():
-        outputs = model(**batch)
+        outputs = embedding_model(**batch)
         embeddings = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
         embeddings = F.normalize(embeddings, p=2, dim=1)
 
@@ -164,7 +175,7 @@ async def query_instruction(text: str):
     batch = {k: v.to(device) for k, v in batch.items()}
 
     with torch.no_grad():
-        outputs = model(**batch)
+        outputs = embedding_model(**batch)
         query_embedding = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
         query_embedding = F.normalize(query_embedding, p=2, dim=1)
 
@@ -197,3 +208,32 @@ async def query_instruction(text: str):
         matched_instruction=INSTRUCTIONS[best_instruction]["name"],
         similarity_score=best_score
     )
+
+@app.post("/asr")
+async def transcribe_audio(file: UploadFile = File(...)):
+    start_time = time.time()
+    
+    # Create a temporary file to store the uploaded audio
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+        # Write uploaded file content to temporary file
+        content = await file.read()
+        temp_file.write(content)
+        temp_file.flush()
+        
+        try:
+            # Transcribe the audio
+            result = whisper_model.transcribe(temp_file.name)
+            text = result["text"]
+        finally:
+            # Clean up the temporary file
+            os.unlink(temp_file.name)
+    
+    elapsed_time = time.time() - start_time
+    
+    return TranscriptionResponse(
+        elapsed_time=elapsed_time,
+        text=text
+    )
+
+# 给出运行的命令
+# uvicorn app:app --host 0.0.0.0 --port 8000
